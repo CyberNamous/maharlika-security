@@ -36,7 +36,21 @@ class Sessions {
     if (remaining <= 0) this.items.delete(this.key(guild, user));
     return { passed: false, remaining: Math.max(0, remaining) };
   }
-  claim(guild, user, id) { const s = this.get(guild, user, id, 'rules'); s.state = 'completing'; return s; }
+  claim(guild, user, id) {
+    const s = this.get(guild, user, id, 'rules');
+    if (s.rulesHash) throw new PublicError('Enter the confirmation code from the rules page to continue.');
+    s.state = 'completing'; return s;
+  }
+  // Rules-page confirmation code check. Success claims the session synchronously (single use).
+  confirmRules(guild, user, id, input) {
+    const s = this.get(guild, user, id, 'rules');
+    if (!s.rulesHash) throw new PublicError('This verification does not use a rules code.');
+    s.rulesAttempts = (s.rulesAttempts || 0) + 1;
+    if (captcha.matches(input, s.rulesHash)) { delete s.rulesHash; s.state = 'completing'; return { passed: true, session: s }; }
+    const remaining = this.attemptLimit - s.rulesAttempts;
+    if (remaining <= 0) this.items.delete(this.key(guild, user));
+    return { passed: false, remaining: Math.max(0, remaining) };
+  }
   delete(guild, user) { return this.items.delete(this.key(guild, user)); }
   clear() { this.items.clear(); this.cooldowns.clear(); }
 }

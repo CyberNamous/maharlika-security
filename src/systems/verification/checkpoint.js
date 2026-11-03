@@ -1,16 +1,24 @@
 'use strict';
 const { PublicError } = require('../../utils/errors');
-const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle, MessageFlags, ButtonStyle } = require('discord.js');
+const { ModalBuilder, ActionRowBuilder, ButtonBuilder, TextInputBuilder, TextInputStyle, MessageFlags, ButtonStyle } = require('discord.js');
 const { C } = require('../../utils/constants');
 const { accountOldEnough } = require('../../utils/validators');
 const { requireGuild, managedRoles, targetMember, textChannel } = require('../../utils/permissions');
 const { embed, buttons, privateReply, NO_MENTIONS } = require('../../utils/embeds');
+const rulesCode = require('../../utils/rulesCode');
 const captcha = require('./captcha');
 const audit = require('../audit/logger');
 const { generateReference, releaseReference } = require('../audit/reference');
 function assertAvailable(ctx) { if (ctx.lockdown.active) throw new PublicError('Verification is temporarily paused by staff. Please try again after it is unlocked.'); }
-function rulesPayload(s) {
-  return { content: '', embeds: [embed('Stage 3: Rules acceptance', C.RULES_SUMMARY + (C.RULES_URL ? '\n\nRules: ' + C.RULES_URL : ''))], components: [buttons([
+function rulesPayload(s, entry) {
+  if (entry) {
+    const text = C.RULES_SUMMARY + '\n\n**Your personal entry code:** `' + rulesCode.pretty(entry) + '`\n\n1. Press Open Rules Page and read the rules.\n2. On the page, type your entry code, tick the box and press Acknowledge & Continue.\n3. Come back here, press Enter Confirmation Code and type the code the page shows you.\n\nThis code belongs to you only. Do not share it.';
+    const link = new ButtonBuilder().setLabel('Open Rules Page').setStyle(ButtonStyle.Link).setURL(C.RULES_URL);
+    const row = buttons([['mh:ropen:' + s.id, 'Enter Confirmation Code', ButtonStyle.Success], ['mh:decline:' + s.id, 'Decline', ButtonStyle.Secondary]]);
+    row.components.unshift(link);
+    return { content: '', embeds: [embed('Stage 3: Rules acknowledgement', text)], components: [row] };
+  }
+  return { content: '', embeds: [embed('Stage 3: Rules acceptance', C.RULES_SUMMARY + (C.RULES_URL ? '\n\nRules: ' + C.RULES_URL : '') + '\n\nBy selecting I Agree, you explicitly accept these rules.')], components: [buttons([
     ['mh:agree:' + s.id, 'I Agree', ButtonStyle.Success], ['mh:decline:' + s.id, 'Decline', ButtonStyle.Secondary]
   ])] };
 }
@@ -60,13 +68,21 @@ async function answer(i, ctx, id) {
     if (error.message.startsWith('Verification expired')) await audit.event(i.guild, ctx, 'CAPTCHA expired', { target: i.user.id });
     return;
   }
-  if (result.passed) return privateReply(i, rulesPayload(result.session));
+  if (result.passed) {
+    let entry;
+    if (ctx.env.RULES_SECRET) {
+      entry = rulesCode.generateEntry();
+      result.session.rulesHash = captcha.digest(rulesCode.confirmationFor(ctx.env.RULES_SECRET, entry));
+      result.session.rulesAttempts = 0;
+    }
+    return privateReply(i, rulesPayload(result.session, entry));
+  }
   await privateReply(i, { content: result.remaining ? 'Incorrect answer. ' + result.remaining + ' attempts remain. Use Enter CAPTCHA again on your private challenge.' : 'CAPTCHA attempts exhausted. Begin verification again after the cooldown.', components: [] });
   if (!result.remaining) await audit.event(i.guild, ctx, 'CAPTCHA attempts exhausted', { target: i.user.id });
 }
-async function complete(i, ctx, id) {
+async function complete(i, ctx, id, claimed = false) {
   assertAvailable(ctx);
-  const s = ctx.sessions.claim(i.guildId, i.user.id, id); // synchronous single-use claim
+  if (!claimed) ctx.sessions.claim(i.guildId, i.user.id, id); // synchronous single-use claim
   let member, reference, attemptedAdd = false, attemptedRemove = false, success = false;
   try {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
@@ -113,15 +129,31 @@ async function complete(i, ctx, id) {
   await privateReply(i, { content: 'Your verification was successful. Welcome to the community!', components: [] });
   if (!record) console.error('[security] Audit delivery was NOT confirmed; see staff alert and inspect Discord.');
 }
+async function openRulesCode(i, ctx, id) {
+  assertAvailable(ctx); ctx.sessions.get(i.guildId, i.user.id, id, 'rules');
+  const input = new TextInputBuilder().setCustomId('rcode').setLabel('Confirmation code from the rules page').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(32);
+  return i.showModal(new ModalBuilder().setCustomId('mh:rsubmit:' + id).setTitle('MAHARLIKA Security').addComponents(new ActionRowBuilder().addComponents(input)));
+}
+async function submitRulesCode(i, ctx, id) {
+  assertAvailable(ctx);
+  let result;
+  try { result = ctx.sessions.confirmRules(i.guildId, i.user.id, id, rulesCode.clean(i.fields.getTextInputValue('rcode'))); }
+  catch (error) { if (!(error instanceof PublicError)) throw error; return privateReply(i, error.message); }
+  if (result.passed) return complete(i, ctx, id, true);
+  await privateReply(i, result.remaining ? 'Incorrect code. ' + result.remaining + ' attempts remain. Check the code on the rules page and use Enter Confirmation Code again.' : 'Too many incorrect codes. Begin verification again after the cooldown.');
+  if (!result.remaining) await audit.event(i.guild, ctx, 'Rules code attempts exhausted', { target: i.user.id });
+}
 async function component(i, ctx) {
   requireGuild(i, ctx);
   if (i.isButton() && i.customId === 'mh:begin') return begin(i, ctx);
-  const match = /^mh:(open|answer|agree|decline):([a-f0-9]{24})$/.exec(i.customId);
+  const match = /^mh:(open|answer|agree|decline|ropen|rsubmit):([a-f0-9]{24})$/.exec(i.customId);
   if (!match) throw new PublicError('Unknown or outdated checkpoint action. Begin verification again.');
   const [, action, id] = match;
-  if ((action === 'answer') !== i.isModalSubmit()) throw new PublicError('Invalid checkpoint interaction type.');
+  if ((action === 'answer' || action === 'rsubmit') !== i.isModalSubmit()) throw new PublicError('Invalid checkpoint interaction type.');
   if (action === 'open') return open(i, ctx, id);
   if (action === 'answer') return answer(i, ctx, id);
+  if (action === 'ropen') return openRulesCode(i, ctx, id);
+  if (action === 'rsubmit') return submitRulesCode(i, ctx, id);
   if (action === 'agree') return complete(i, ctx, id);
   ctx.sessions.get(i.guildId, i.user.id, id, 'rules'); ctx.sessions.delete(i.guildId, i.user.id);
   return privateReply(i, { content: 'Rules were not accepted. You remain unverified.', components: [] });

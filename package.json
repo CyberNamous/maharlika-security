@@ -1,0 +1,19 @@
+{
+  "name": "maharlika-security",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Independent Discord verification, audit, and server-security bot.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0 <25"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node scripts/deploy-commands.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "discord.js": "14.28.0",
+    "dotenv": "18.0.9"
+  }
+}

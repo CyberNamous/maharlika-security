@@ -13,4 +13,6 @@ function confirmationFor(secret, entry, length = C.RULES_CONFIRM_LENGTH) {
   return out;
 }
 const pretty = code => code.slice(0, Math.ceil(code.length / 2)) + '-' + code.slice(Math.ceil(code.length / 2));
-module.exports = { ALPHABET, clean, generateEntry, confirmationFor, pretty };
+// Rules-page link with the entry code in the URL fragment (never sent to a server, read only by the page).
+function linkFor(base, entry) { return base.includes('#') ? base : base + '#code=' + pretty(clean(entry)); }
+module.exports = { ALPHABET, clean, generateEntry, confirmationFor, pretty, linkFor };

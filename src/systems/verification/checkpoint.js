@@ -12,8 +12,8 @@ const { generateReference, releaseReference } = require('../audit/reference');
 function assertAvailable(ctx) { if (ctx.lockdown.active) throw new PublicError('Verification is temporarily paused by staff. Please try again after it is unlocked.'); }
 function rulesPayload(s, entry) {
   if (entry) {
-    const text = C.RULES_SUMMARY + '\n\n**Your personal entry code:** `' + rulesCode.pretty(entry) + '`\n\n1. Press Open Rules Page and read the rules.\n2. On the page, type your entry code, tick the box and press Acknowledge & Continue.\n3. Come back here, press Enter Confirmation Code and type the code the page shows you.\n\nThis code belongs to you only. Do not share it.';
-    const link = new ButtonBuilder().setLabel('Open Rules Page').setStyle(ButtonStyle.Link).setURL(C.RULES_URL);
+    const text = C.RULES_SUMMARY + '\n\n**Your personal entry code:** `' + rulesCode.pretty(entry) + '`\n\n1. Press Open Rules Page and read the rules.\n2. On the page your entry code is filled in for you (type it if it is not). Tick the box and press Acknowledge & Continue.\n3. Tap Copy code, come back here, press Enter Confirmation Code and paste it.\n\nThis code belongs to you only. Do not share it.';
+    const link = new ButtonBuilder().setLabel('Open Rules Page').setStyle(ButtonStyle.Link).setURL(rulesCode.linkFor(C.RULES_URL, entry));
     const row = buttons([['mh:ropen:' + s.id, 'Enter Confirmation Code', ButtonStyle.Success], ['mh:decline:' + s.id, 'Decline', ButtonStyle.Secondary]]);
     row.components.unshift(link);
     return { content: '', embeds: [embed('Stage 3: Rules acknowledgement', text)], components: [row] };
@@ -21,6 +21,33 @@ function rulesPayload(s, entry) {
   return { content: '', embeds: [embed('Stage 3: Rules acceptance', C.RULES_SUMMARY + (C.RULES_URL ? '\n\nRules: ' + C.RULES_URL : '') + '\n\nBy selecting I Agree, you explicitly accept these rules.')], components: [buttons([
     ['mh:agree:' + s.id, 'I Agree', ButtonStyle.Success], ['mh:decline:' + s.id, 'Decline', ButtonStyle.Secondary]
   ])] };
+}
+// Only the server owner and the community-manager role (ADMIN_ROLE_ID) skip verification.
+function isExempt(i, ctx, member) {
+  return i.user.id === i.guild.ownerId || (!!ctx.env.ADMIN_ROLE_ID && member.roles.cache.has(ctx.env.ADMIN_ROLE_ID));
+}
+async function exemptVerify(i, ctx, member) {
+  let attemptedAdd = false, attemptedRemove = false;
+  try {
+    await managedRoles(i.guild, ctx.env);
+    await textChannel(i.guild, ctx.env.AUDIT_CHANNEL_ID, false, true);
+    assertAvailable(ctx);
+    attemptedAdd = true;
+    await member.roles.add(ctx.env.MEMBER_ROLE_ID, 'Exempt from verification (server owner or community manager)');
+    if (member.roles.cache.has(ctx.env.UNVERIFIED_ROLE_ID)) { attemptedRemove = true; await member.roles.remove(ctx.env.UNVERIFIED_ROLE_ID, 'Exempt from verification'); }
+  } catch (error) {
+    let rollbackFailed = false;
+    if (attemptedAdd) {
+      if (attemptedRemove) { try { await member.roles.add(ctx.env.UNVERIFIED_ROLE_ID, 'Exemption rollback'); } catch (e) { rollbackFailed = true; audit.logFailure('Exempt rollback restore Unverified failed', e); } }
+      try { await member.roles.remove(ctx.env.MEMBER_ROLE_ID, 'Exemption rollback'); } catch (e) { rollbackFailed = true; audit.logFailure('Exempt rollback remove Member failed', e); }
+    }
+    await audit.event(i.guild, ctx, 'Exempt role assignment failed', { target: i.user.id, detail: rollbackFailed ? 'Partial role change; rollback failed. Staff must inspect current roles.' : 'Exempt member was not given the Member role. Inspect permissions and role hierarchy.' });
+    audit.logFailure('Exempt verification failed', error);
+    if (error instanceof PublicError) return privateReply(i, error.message);
+    return privateReply(i, 'The Member role could not be assigned. Staff have been notified when possible.');
+  }
+  await audit.event(i.guild, ctx, 'Exempt member verified', { target: i.user.id, detail: 'Skipped checks: server owner or community manager.' });
+  return privateReply(i, { content: 'You are exempt from verification as the server owner or a community manager. The Member role has been given. Welcome!', components: [] });
 }
 async function begin(i, ctx) {
   requireGuild(i, ctx); assertAvailable(ctx);
@@ -33,6 +60,7 @@ async function begin(i, ctx) {
   const member = await targetMember(i.guild, i.user.id);
   if (member.user.bot) throw new PublicError('Bot accounts cannot use this checkpoint.');
   if (member.roles.cache.has(ctx.env.MEMBER_ROLE_ID)) return privateReply(i, 'You already have the Member role.');
+  if (isExempt(i, ctx, member)) return exemptVerify(i, ctx, member);
   if (!accountOldEnough(i.user.createdTimestamp)) {
     await privateReply(i, 'Your Discord account must be at least ' + C.MIN_ACCOUNT_AGE_DAYS + ' complete days old. You have not been banned.');
     // Use the bounded start limiter even for repeated under-age attempts.
@@ -50,7 +78,7 @@ async function begin(i, ctx) {
   assertAvailable(ctx);
   const answer = captcha.generate();
   const s = ctx.sessions.create(i.guildId, i.user.id, answer);
-  return privateReply(i, { embeds: [embed('Stage 2: Typed CAPTCHA', 'Stage 1 passed. Type this code in the answer modal:\n\n**' + answer + '**\n\nExpires ' + C.CAPTCHA_EXPIRY_SECONDS + ' seconds after this challenge was issued; up to ' + C.CAPTCHA_MAX_ATTEMPTS + ' attempts. This text check is not strong anti-automation protection.')], components: [buttons([['mh:open:' + s.id, 'Enter CAPTCHA']])] });
+  return privateReply(i, { embeds: [embed('Stage 2: Typed CAPTCHA', 'Stage 1 passed. Type this code in the answer modal:\n\n**' + answer + '**\n\nExpires ' + C.CAPTCHA_EXPIRY_SECONDS + ' seconds after this challenge was issued; up to ' + C.CAPTCHA_MAX_ATTEMPTS + ' attempts. This text check is not strong anti-automation protection.')], components: [buttons([['mh:open:' + s.id, 'Enter CAPTCHA'], ['mh:help:' + s.id, 'Having trouble?', ButtonStyle.Secondary]])] });
 }
 async function open(i, ctx, id) {
   assertAvailable(ctx); ctx.sessions.get(i.guildId, i.user.id, id, 'captcha');
@@ -143,13 +171,18 @@ async function submitRulesCode(i, ctx, id) {
   await privateReply(i, result.remaining ? 'Incorrect code. ' + result.remaining + ' attempts remain. Check the code on the rules page and use Enter Confirmation Code again.' : 'Too many incorrect codes. Begin verification again after the cooldown.');
   if (!result.remaining) await audit.event(i.guild, ctx, 'Rules code attempts exhausted', { target: i.user.id });
 }
+function helpPayload() {
+  const text = '**Typing the code**\n- Type it exactly as shown. Upper or lower case both work.\n- Do not add spaces inside the code.\n- The code never contains the letters I or O, or the numbers 0 or 1, so there are no look-alike characters.\n\n**If something is not working**\n- The box does not open or the button does nothing: update Discord, then press the button again.\n- Your code was rejected or time ran out: go back to the verification channel and press Begin Verification for a new code. If it asks you to wait, try again in a little while.\n- You cannot find this message anymore: it may have been dismissed. Press Begin Verification again.\n- It says verification is paused: staff paused it for now. Please try again later.\n\nStill stuck? Contact a staff member and we will help.';
+  return { embeds: [embed('Having trouble?', text)], components: [] };
+}
 async function component(i, ctx) {
   requireGuild(i, ctx);
   if (i.isButton() && i.customId === 'mh:begin') return begin(i, ctx);
-  const match = /^mh:(open|answer|agree|decline|ropen|rsubmit):([a-f0-9]{24})$/.exec(i.customId);
+  const match = /^mh:(open|answer|agree|decline|ropen|rsubmit|help):([a-f0-9]{24})$/.exec(i.customId);
   if (!match) throw new PublicError('Unknown or outdated checkpoint action. Begin verification again.');
   const [, action, id] = match;
   if ((action === 'answer' || action === 'rsubmit') !== i.isModalSubmit()) throw new PublicError('Invalid checkpoint interaction type.');
+  if (action === 'help') return privateReply(i, helpPayload());
   if (action === 'open') return open(i, ctx, id);
   if (action === 'answer') return answer(i, ctx, id);
   if (action === 'ropen') return openRulesCode(i, ctx, id);
@@ -158,4 +191,4 @@ async function component(i, ctx) {
   ctx.sessions.get(i.guildId, i.user.id, id, 'rules'); ctx.sessions.delete(i.guildId, i.user.id);
   return privateReply(i, { content: 'Rules were not accepted. You remain unverified.', components: [] });
 }
-module.exports = { component, begin, complete, rulesPayload };
+module.exports = { component, begin, complete, rulesPayload, isExempt, helpPayload };
